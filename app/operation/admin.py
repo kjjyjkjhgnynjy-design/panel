@@ -2,6 +2,7 @@ import asyncio
 import warnings
 from datetime import datetime as dt
 
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app import notification
@@ -19,6 +20,7 @@ from app.db.crud.admin import (
     reset_admin_usage,
     update_admin,
 )
+from app.db.crud.admin_hierarchy import get_admin_ancestor_map
 from app.db.crud.bulk import activate_all_disabled_users, disable_all_active_users
 from app.db.crud.user import get_admin_users_for_node_sync, get_users, remove_users
 from app.db.models import Admin, AdminStatus
@@ -48,6 +50,8 @@ from app.utils.logger import get_logger
 
 logger = get_logger("admin-operation")
 
+MIN_PARENT_REMAINING_BYTES = 500 * 1024**3
+
 
 def _set_limits(limits: RoleLimits | None) -> dict:
     """The limits that are actually set; no overrides and all-null overrides are the same."""
@@ -59,12 +63,56 @@ class AdminOperation(BaseOperation):
     def _is_owner_admin(db_admin: Admin) -> bool:
         return db_admin.role_id == 1
 
-    async def _ensure_owner_target_access(self, db_admin: Admin, current_admin: AdminDetails) -> None:
-        if not current_admin.is_owner and self._is_owner_admin(db_admin):
-            await self.raise_error(message="Owner account is not accessible.", code=403)
+    async def _ensure_owner_target_access(
+        self, db_admin: Admin, current_admin: AdminDetails, *, allow_self: bool = False
+    ) -> None:
+        if current_admin.is_owner:
+            return
+        if allow_self and current_admin.id is not None and db_admin.id == current_admin.id:
+            return
+        if current_admin.id is None or db_admin.parent_admin_id != current_admin.id:
+            await self.raise_error(message="Admin account is outside your direct subadmins.", code=403)
+
+    async def _ensure_no_admin_children(self, db: AsyncSession, db_admin: Admin) -> None:
+        child_id = await db.scalar(select(Admin.id).where(Admin.parent_admin_id == db_admin.id).limit(1))
+        if child_id is not None:
+            await self.raise_error(message="Delete this admin's subadmins first.", code=409)
+
+    async def _has_parent_quota_headroom(self, db: AsyncSession, admin: AdminDetails) -> bool:
+        if admin.id is None:
+            return False
+        ancestor_map = await get_admin_ancestor_map(db, [admin.id])
+        affected_admin_ids = ancestor_map.get(admin.id, [admin.id])
+        rows = await db.execute(
+            select(Admin.data_limit, Admin.used_traffic).where(Admin.id.in_(affected_admin_ids))
+        )
+        for data_limit, used_traffic in rows.all():
+            if data_limit is not None and data_limit > 0:
+                if data_limit - int(used_traffic or 0) < MIN_PARENT_REMAINING_BYTES:
+                    return False
+        return True
+
+    @staticmethod
+    def _parent_blocks_users(admin: AdminDetails) -> bool:
+        return admin.blocked_by_parent or admin.status in (AdminStatus.limited, AdminStatus.disabled)
 
     async def create_admin(self, db: AsyncSession, new_admin: AdminCreate, admin: AdminDetails) -> AdminDetails:
         """Create a new admin."""
+        parent_admin_id = None
+        blocked_by_parent = False
+        if not admin.is_owner:
+            if admin.id is None or admin.role is None or admin.role.id is None:
+                await self.raise_error(message="Your admin account cannot create subadmins.", code=403)
+            if new_admin.data_limit is None or new_admin.data_limit <= 0:
+                await self.raise_error(message="A finite traffic quota is required for a subadmin.", code=422)
+            if not await self._has_parent_quota_headroom(db, admin):
+                await self.raise_error(message="At least 500 GB of parent quota must remain.", code=403)
+            new_admin = new_admin.model_copy(
+                update={"role_id": admin.role.id, "permission_overrides": admin.permission_overrides}
+            )
+            parent_admin_id = admin.id
+            blocked_by_parent = self._parent_blocks_users(admin)
+
         if new_admin.role_id == 1:
             await self.raise_error(
                 message="Owner role cannot be assigned via this endpoint. Use the setup flow.", code=403
@@ -76,14 +124,19 @@ class AdminOperation(BaseOperation):
                 await self.raise_error(message="Telegram ID is already assigned to another admin.", code=409, db=db)
 
         try:
-            db_admin = await create_admin(db, new_admin)
+            db_admin = await create_admin(
+                db,
+                new_admin,
+                parent_admin_id=parent_admin_id,
+                blocked_by_parent=blocked_by_parent,
+            )
         except IntegrityError:
             await self.raise_error(message="Admin already exists", code=409, db=db)
 
         logger.info(f'New admin "{db_admin.username}" with id "{db_admin.id}" added by admin "{admin.username}"')
         new_admin_details = build_admin_details(db_admin, include_loaded_metrics=True)
         asyncio.create_task(notification.create_admin(new_admin_details, admin.username))
-        return db_admin
+        return new_admin_details
 
     async def modify_admin(
         self, db: AsyncSession, username: str, modified_admin: AdminModify, current_admin: AdminDetails
@@ -94,7 +147,7 @@ class AdminOperation(BaseOperation):
             stacklevel=2,
         )
         db_admin = await self.get_validated_admin(db, username=username)
-        await self._ensure_owner_target_access(db_admin, current_admin)
+        await self._ensure_owner_target_access(db_admin, current_admin, allow_self=True)
         return await self._modify_admin(db, db_admin, modified_admin, current_admin)
 
     async def _modify_admin(
@@ -117,6 +170,25 @@ class AdminOperation(BaseOperation):
             await self.raise_error(
                 message="Owner role cannot be changed via this endpoint. Use the setup flow.", code=403
             )
+
+        is_direct_child = db_admin.parent_admin_id == current_admin.id and not current_admin.is_owner
+        if is_direct_child:
+            if modified_admin.role_id is not None and modified_admin.role_id != db_admin.role_id:
+                await self.raise_error(message="You're not allowed to change a subadmin's role.", code=403)
+            if modified_admin.permission_overrides is not None and _set_limits(
+                modified_admin.permission_overrides
+            ) != _set_limits(db_admin.permission_overrides):
+                await self.raise_error(message="You're not allowed to change a subadmin's role limits.", code=403)
+            if modified_admin.data_limit is not None:
+                existing_limit = db_admin.data_limit if db_admin.data_limit and db_admin.data_limit > 0 else None
+                requested_limit = modified_admin.data_limit if modified_admin.data_limit > 0 else None
+                if requested_limit is None and existing_limit is not None:
+                    await self.raise_error(message="A subadmin must keep a finite traffic quota.", code=422)
+                if requested_limit is not None and (
+                    existing_limit is None or requested_limit > existing_limit
+                ):
+                    if not await self._has_parent_quota_headroom(db, current_admin):
+                        await self.raise_error(message="At least 500 GB of parent quota must remain.", code=403)
 
         if (
             not current_admin.is_owner
@@ -171,7 +243,7 @@ class AdminOperation(BaseOperation):
         self, db: AsyncSession, admin_id: int, modified_admin: AdminModify, current_admin: AdminDetails
     ) -> AdminDetails:
         db_admin = await self.get_validated_admin_by_id(db, admin_id)
-        await self._ensure_owner_target_access(db_admin, current_admin)
+        await self._ensure_owner_target_access(db_admin, current_admin, allow_self=True)
         return await self._modify_admin(db, db_admin, modified_admin, current_admin)
 
     async def remove_admin(self, db: AsyncSession, username: str, current_admin: AdminDetails | None = None):
@@ -190,6 +262,10 @@ class AdminOperation(BaseOperation):
         if db_admin.role_id == 1:
             await self.raise_error(message="Owner cannot be deleted via this endpoint. Use the setup flow.", code=403)
 
+        if current_admin is not None and not current_admin.is_owner and db_admin.id == current_admin.id:
+            await self.raise_error(message="You're not allowed to delete your own account.", code=403)
+        await self._ensure_no_admin_children(db, db_admin)
+
         await remove_admin(db, db_admin)
         if current_admin:
             logger.info(
@@ -205,12 +281,15 @@ class AdminOperation(BaseOperation):
 
     async def get_admins(self, db: AsyncSession, query: AdminListQuery, admin: AdminDetails) -> AdminsResponse:
         """Retrieve a list of admins with optional filters and pagination."""
+        if not admin.is_owner and admin.id is None:
+            await self.raise_error(message="Admin account is unavailable.", code=403)
         admins, total, active, disabled, limited = await get_admins(
             db,
             query,
             return_with_count=True,
             compact=True,
             include_owner=admin.is_owner,
+            parent_admin_id=None if admin.is_owner else admin.id,
         )
         return AdminsResponse(admins=admins, total=total, active=active, disabled=disabled, limited=limited)
 
@@ -218,7 +297,14 @@ class AdminOperation(BaseOperation):
         self, db: AsyncSession, query: AdminSimpleListQuery, admin: AdminDetails
     ) -> AdminsSimpleResponse:
         """Get lightweight admin list with only id and username."""
-        rows, total = await get_admins_simple(db=db, query=query, include_owner=admin.is_owner)
+        if not admin.is_owner and admin.id is None:
+            await self.raise_error(message="Admin account is unavailable.", code=403)
+        rows, total = await get_admins_simple(
+            db=db,
+            query=query,
+            include_owner=admin.is_owner,
+            parent_admin_id=None if admin.is_owner else admin.id,
+        )
         admins = [AdminSimple(id=row[0], username=row[1]) for row in rows]
         return AdminsSimpleResponse(admins=admins, total=total)
 
@@ -343,7 +429,7 @@ class AdminOperation(BaseOperation):
             stacklevel=2,
         )
         db_admin = await self.get_validated_admin(db, username=username)
-        await self._ensure_owner_target_access(db_admin, admin)
+        await self._ensure_owner_target_access(db_admin, admin, allow_self=True)
         return await self._get_admin_usage(
             db,
             db_admin,
@@ -395,7 +481,7 @@ class AdminOperation(BaseOperation):
         self, db: AsyncSession, admin_id: int, admin: AdminDetails, query: AdminUsageQuery
     ) -> UserUsageStatsList:
         db_admin = await self.get_validated_admin_by_id(db, admin_id)
-        await self._ensure_owner_target_access(db_admin, admin)
+        await self._ensure_owner_target_access(db_admin, admin, allow_self=True)
         return await self._get_admin_usage(
             db,
             db_admin,
@@ -414,6 +500,10 @@ class AdminOperation(BaseOperation):
         db_admins = await self._get_validated_bulk_admins(db, bulk_admins.ids, admin)
         if any(self._is_owner_admin(db_admin) for db_admin in db_admins):
             await self.raise_error(message="Owner cannot be deleted via this endpoint. Use the setup flow.", code=403)
+        if not admin.is_owner and any(db_admin.id == admin.id for db_admin in db_admins):
+            await self.raise_error(message="You're not allowed to delete your own account.", code=403)
+        for db_admin in db_admins:
+            await self._ensure_no_admin_children(db, db_admin)
 
         usernames = [a.username for a in db_admins]
         admin_ids = [a.id for a in db_admins]

@@ -1,6 +1,9 @@
 import asyncio
 from collections.abc import Sequence
 
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
 from app.db import AsyncSession, GetDB
 from app.db.crud.admin import get_active_to_limited_admins, update_admin_status
 from app.db.crud.admin_role import get_role
@@ -21,6 +24,9 @@ _role_sync_tasks: set[asyncio.Task] = set()
 
 async def admin_users_sync_blocked(admin: Admin) -> bool:
     """Return whether the admin's current status and role policy block node access."""
+    if admin.blocked_by_parent:
+        return True
+
     role = admin.__dict__.get("role")
     if role is None:
         try:
@@ -29,9 +35,9 @@ async def admin_users_sync_blocked(admin: Admin) -> bool:
             role = None
 
     if admin.status == AdminStatus.limited:
-        return bool(role and role.disconnect_users_when_limited)
+        return admin.parent_admin_id is not None or bool(role and role.disconnect_users_when_limited)
     if admin.status == AdminStatus.disabled:
-        return bool(role and role.disconnect_users_when_disabled)
+        return admin.parent_admin_id is not None or bool(role and role.disconnect_users_when_disabled)
     return False
 
 
@@ -40,23 +46,70 @@ async def sync_admin_users_for_block_transition(
     admin: Admin,
     was_blocked: bool,
 ) -> int:
-    """Dispatch user removals or restorations when an admin's block state changes."""
-    is_blocked = await admin_users_sync_blocked(admin)
-    if was_blocked == is_blocked:
-        return 0
+    """Recompute inherited blocks and reconcile all users in the affected subtree."""
+    subtree_ids = {admin.id}
+    descendants = []
+    frontier = {admin.id}
+    while frontier:
+        frontier_ids = list(frontier)
+        children = []
+        for offset in range(0, len(frontier_ids), 500):
+            children.extend(
+                (
+                    await db.scalars(
+                        select(Admin)
+                        .options(selectinload(Admin.role))
+                        .where(Admin.parent_admin_id.in_(frontier_ids[offset : offset + 500]))
+                    )
+                ).all()
+            )
+        descendants.extend(children)
+        subtree_ids.update(child.id for child in children)
+        frontier = {child.id for child in children}
 
-    if is_blocked:
+    old_blocked = {admin.id: was_blocked}
+    new_blocked = {admin.id: await admin_users_sync_blocked(admin)}
+
+    # Parents are visited before their children so each inherited flag reflects the
+    # effective state after applying the parent's own status and inherited block.
+    pending = [admin]
+    children_by_parent: dict[int, list[Admin]] = {}
+    for child in descendants:
+        children_by_parent.setdefault(child.parent_admin_id, []).append(child)
+    changed = False
+    while pending:
+        parent = pending.pop(0)
+        parent_blocked = new_blocked[parent.id] or parent.status in (AdminStatus.limited, AdminStatus.disabled)
+        for child in children_by_parent.get(parent.id, []):
+            old_blocked[child.id] = await admin_users_sync_blocked(child)
+            if child.blocked_by_parent != parent_blocked:
+                child.blocked_by_parent = parent_blocked
+                changed = True
+            new_blocked[child.id] = await admin_users_sync_blocked(child)
+            pending.append(child)
+
+    if changed:
+        await db.commit()
+
+    blocked_ids = [admin_id for admin_id in subtree_ids if not old_blocked.get(admin_id, False) and new_blocked[admin_id]]
+    unblocked_ids = [admin_id for admin_id in subtree_ids if old_blocked.get(admin_id, False) and not new_blocked[admin_id]]
+    synced_count = 0
+
+    if blocked_ids:
         users = await get_admin_users_for_node_sync(
             db,
-            admin.id,
+            blocked_ids,
             statuses=[UserStatus.active, UserStatus.on_hold],
         )
         await sync_remove_users(users)
-    else:
-        users = await get_admin_users_for_node_sync(db, admin.id)
-        await sync_users(users)
+        synced_count += len(users)
 
-    return len(users)
+    if unblocked_ids:
+        users = await get_admin_users_for_node_sync(db, unblocked_ids)
+        await sync_users(users)
+        synced_count += len(users)
+
+    return synced_count
 
 
 async def sync_role_users_for_block_transition(
