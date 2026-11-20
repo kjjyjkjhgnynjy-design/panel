@@ -241,7 +241,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       ...(canReadAdmins
         ? [
             {
-              title: 'admins.title',
+              title: isOwner(admin) ? 'admins.title' : 'admins.mySubadminsTitle',
               url: '/admins',
               icon: UserCog,
             },

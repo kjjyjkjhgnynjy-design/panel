@@ -89,7 +89,9 @@ export function CommandPalette() {
     if (hasPermission(admin, 'nodes', 'stats')) items.push({ title: 'statistics', url: '/statistics', icon: PieChart })
     if (canReadResourcePage(admin, 'hosts')) items.push({ title: 'hosts', url: '/hosts', icon: ListTodo })
     if (canReadResourcePage(admin, 'groups')) items.push({ title: 'groups', url: '/groups', icon: Group })
-    if (canReadResourcePage(admin, 'admins')) items.push({ title: 'admins.title', url: '/admins', icon: UserCog })
+    if (canReadResourcePage(admin, 'admins')) {
+      items.push({ title: isOwner(admin) ? 'admins.title' : 'admins.mySubadminsTitle', url: '/admins', icon: UserCog })
+    }
     if (canReadResourcePage(admin, 'nodes')) items.push({ title: 'nodes.title', url: '/nodes', icon: Share2Icon })
     if (canReadResourcePage(admin, 'cores')) items.push({ title: 'settings.cores.title', url: '/nodes/cores', icon: Cpu })
     if (canReadResourcePage(admin, 'templates')) items.push({ title: 'templates.userTemplates', url: '/templates/user', icon: FileUser })
