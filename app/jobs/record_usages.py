@@ -17,6 +17,7 @@ from sqlalchemy.sql.expression import Insert
 from app import on_shutdown, scheduler
 from app.db import GetDB
 from app.db.base import engine
+from app.db.crud.admin_hierarchy import get_admin_ancestor_map
 from app.db.models import Admin, Node, NodeOutboundUsage, NodeUsage, NodeUserUsage, System, User
 from app.node import node_manager
 from app.operation.admin_sync import enforce_admin_limits_now
@@ -972,13 +973,17 @@ async def calculate_admin_usage(users_usage: list) -> tuple[dict, set[int]]:
             result = await db.execute(stmt)
             user_admin_pairs.extend(result.fetchall())
 
+        direct_admin_ids = {admin_id for _, admin_id in user_admin_pairs if admin_id is not None}
+        ancestor_map = await get_admin_ancestor_map(db, direct_admin_ids)
+
     user_admin_map = {uid: admin_id for uid, admin_id in user_admin_pairs}
 
     admin_usage = defaultdict(int)
     for user_usage in users_usage:
         admin_id = user_admin_map.get(int(user_usage["uid"]))
         if admin_id:
-            admin_usage[admin_id] += user_usage["value"]
+            for affected_admin_id in ancestor_map.get(admin_id, [admin_id]):
+                admin_usage[affected_admin_id] += user_usage["value"]
 
     return admin_usage, set(user_admin_map.keys())
 
