@@ -138,11 +138,14 @@ export const setupColumns = ({
     id: 'status',
     header: () => <div className="flex items-center text-xs capitalize">{t('usersTable.status')}</div>,
     cell: ({ row }) => {
-      const status = getAdminStatus(row.original)
+      const status = row.original.blocked_by_parent ? 'disabled' : getAdminStatus(row.original)
+      const statusLabel = row.original.blocked_by_parent
+        ? t('admins.blockedByParent', { defaultValue: 'Stopped by parent' })
+        : t(`status.${status}`)
       return (
         <div className="flex flex-col gap-y-2 py-1">
           <div className="hidden md:block">
-            <AdminStatusBadge isSudo={isOwner(row.original)} status={status} label={t(`status.${status}`)} />
+            <AdminStatusBadge isSudo={isOwner(row.original)} status={status} label={statusLabel} />
           </div>
           <div className="md:hidden">
             <AdminStatusBadge compact isSudo={isOwner(row.original)} status={status} />
