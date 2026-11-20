@@ -860,6 +860,11 @@
   "editedAt": "Edited at",
   "admins": {
     "title": "Admins",
+    "mySubadminsTitle": "My subadmins",
+    "mySubadminsDescription": "Create and manage your subadmins. Their users' traffic counts toward your quota.",
+    "createSubadmin": "Create subadmin",
+    "subadminQuotaHint": "At least 500 GB must remain in your quota and each parent quota before creating or increasing a subadmin quota.",
+    "blockedByParent": "Stopped by parent admin",
     "description": "Manage system administrators",
     "passkeys": "Passkeys",
     "passkey": "Passkey",
