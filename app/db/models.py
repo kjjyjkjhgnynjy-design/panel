@@ -100,6 +100,8 @@ class Admin(Base, CreatedAtUTCMixin):
     __tablename__ = "admins"
     username: Mapped[str] = mapped_column(String(34), unique=True, index=True)
     hashed_password: Mapped[str] = mapped_column(String(128))
+    parent_admin_id: Mapped[int | None] = fk_id_column("admins.id", default=None, ondelete="RESTRICT", index=True)
+    blocked_by_parent: Mapped[bool] = mapped_column(default=False, server_default="0")
     users: Mapped[list[User]] = relationship(back_populates="admin", init=False, default_factory=list)
     usage_logs: Mapped[list[AdminUsageLogs]] = relationship(
         back_populates="admin", init=False, default_factory=list, cascade="all, delete-orphan"
@@ -173,6 +175,10 @@ class Admin(Base, CreatedAtUTCMixin):
     @property
     def users_sync_blocked(self) -> bool:
         """True when this admin's users should NOT be synced to nodes."""
+        if self.blocked_by_parent:
+            return True
+        if self.parent_admin_id is not None and self.status in (AdminStatus.limited, AdminStatus.disabled):
+            return True
         return (self.status == AdminStatus.limited and self.role.disconnect_users_when_limited) or (
             self.status == AdminStatus.disabled and self.role.disconnect_users_when_disabled
         )
@@ -212,6 +218,25 @@ class AdminUsageLogs(Base, IdMixin):
     admin: Mapped[Admin] = relationship(back_populates="usage_logs", init=False)
     used_traffic_at_reset: Mapped[int] = mapped_column(BigInteger, nullable=False)
     reset_at: Mapped[dt] = mapped_column(DateTime(timezone=True), default=lambda: dt.now(UTC), init=False)
+
+
+class AdminAccountingEntryType(str, Enum):
+    sale = "sale"
+    cost = "cost"
+    expense = "expense"
+
+
+class AdminAccountingEntry(Base, CreatedAtUTCMixin):
+    __tablename__ = "admin_accounting_entries"
+    __table_args__ = (
+        Index("ix_admin_accounting_entries_admin_created", "admin_id", "created_at"),
+    )
+
+    admin_id: Mapped[int] = fk_id_column("admins.id", ondelete="CASCADE")
+    kind: Mapped[str] = mapped_column(String(16))
+    amount: Mapped[int] = mapped_column(BigInteger)
+    description: Mapped[str | None] = mapped_column(String(500), default=None)
+    user_id: Mapped[int | None] = fk_id_column("users.id", ondelete="SET NULL", default=None)
 
 
 class ReminderType(str, Enum):
