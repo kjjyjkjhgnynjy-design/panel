@@ -453,6 +453,8 @@ export interface AdminRoleData {
 export interface AdminDetails {
   id?: number | null;
   username: string;
+  parent_admin_id?: number | null;
+  blocked_by_parent?: boolean;
   telegram_id?: number | null;
   discord_webhook?: string | null;
   sub_domain?: string | null;
