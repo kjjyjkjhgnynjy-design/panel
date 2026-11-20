@@ -193,9 +193,22 @@ async def core_users(
         .where(
             or_(
                 Admin.id.is_(None),
-                Admin.status.not_in([AdminStatus.limited, AdminStatus.disabled]),
-                and_(Admin.status == AdminStatus.limited, AdminRole.disconnect_users_when_limited.is_not(True)),
-                and_(Admin.status == AdminStatus.disabled, AdminRole.disconnect_users_when_disabled.is_not(True)),
+                and_(
+                    Admin.blocked_by_parent.is_(False),
+                    or_(
+                        Admin.status.not_in([AdminStatus.limited, AdminStatus.disabled]),
+                        and_(
+                            Admin.parent_admin_id.is_(None),
+                            Admin.status == AdminStatus.limited,
+                            AdminRole.disconnect_users_when_limited.is_not(True),
+                        ),
+                        and_(
+                            Admin.parent_admin_id.is_(None),
+                            Admin.status == AdminStatus.disabled,
+                            AdminRole.disconnect_users_when_disabled.is_not(True),
+                        ),
+                    ),
+                ),
             )
         )
         .group_by(User.id)

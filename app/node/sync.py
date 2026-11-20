@@ -65,8 +65,12 @@ def _loaded_admin_sync_blocked(admin: Admin) -> bool | None:
     status = state.get("status")
     if status is None:
         return None
+    if state.get("blocked_by_parent"):
+        return True
     if status not in (AdminStatus.limited, AdminStatus.disabled):
         return False
+    if state.get("parent_admin_id") is not None:
+        return True
 
     role = state.get("role")
     if role is None:
@@ -92,13 +96,28 @@ async def _user_sync_blocked(db_user: User) -> bool:
         return False
 
     stmt = (
-        select(Admin.status, AdminRole.disconnect_users_when_limited, AdminRole.disconnect_users_when_disabled)
+        select(
+            Admin.status,
+            Admin.blocked_by_parent,
+            Admin.parent_admin_id,
+            AdminRole.disconnect_users_when_limited,
+            AdminRole.disconnect_users_when_disabled,
+        )
         .select_from(Admin)
         .join(AdminRole, AdminRole.id == Admin.role_id)
         .where(Admin.id == db_user.admin_id)
     )
     row = (await session.execute(stmt)).one_or_none()
-    return bool(row and ((row[0] == AdminStatus.limited and row[1]) or (row[0] == AdminStatus.disabled and row[2])))
+    status_blocked = bool(
+        row
+        and row[0] in (AdminStatus.limited, AdminStatus.disabled)
+        and (
+            row[2] is not None
+            or (row[0] == AdminStatus.limited and row[3])
+            or (row[0] == AdminStatus.disabled and row[4])
+        )
+    )
+    return bool(row and (row[1] or status_blocked))
 
 
 async def _blocked_admin_ids_for_users(users: list[User]) -> set[int]:
@@ -130,7 +149,9 @@ async def _blocked_admin_ids_for_users(users: list[User]) -> set[int]:
         .where(
             Admin.id.in_(admin_ids),
             (
-                ((Admin.status == AdminStatus.limited) & (AdminRole.disconnect_users_when_limited.is_(True)))
+                Admin.blocked_by_parent.is_(True)
+                | (Admin.parent_admin_id.is_not(None) & Admin.status.in_([AdminStatus.limited, AdminStatus.disabled]))
+                | ((Admin.status == AdminStatus.limited) & (AdminRole.disconnect_users_when_limited.is_(True)))
                 | ((Admin.status == AdminStatus.disabled) & (AdminRole.disconnect_users_when_disabled.is_(True)))
             ),
         )
