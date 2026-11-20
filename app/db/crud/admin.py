@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from sqlalchemy import and_, case, delete, func, not_, select, update
+from sqlalchemy import and_, case, delete, func, not_, or_, select, update
 from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
@@ -12,6 +12,7 @@ from app.db.crud.general import (
     get_complete_period_start_for_filter,
     to_utc_for_filter,
 )
+from app.db.crud.admin_hierarchy import get_admin_descendant_ids
 from app.db.models import (
     Admin,
     AdminNotificationReminder,
@@ -37,6 +38,7 @@ from app.models.admin import (
     AdminSortOption,
     AdminStatus,
     hash_password,
+    restrict_subadmin_role,
 )
 from app.models.admin_role import RoleLimits
 from app.models.stats import Period, UserUsageStat, UserUsageStatsList
@@ -84,6 +86,8 @@ def build_admin_details(
     return AdminDetails(
         id=db_admin.id,
         username=db_admin.username,
+        parent_admin_id=db_admin.parent_admin_id,
+        blocked_by_parent=db_admin.blocked_by_parent,
         total_users=int(total_users or 0),
         used_traffic=used_traffic,
         data_limit=db_admin.data_limit,
@@ -98,7 +102,7 @@ def build_admin_details(
         notification_enable=db_admin.notification_enable,
         sub_template=db_admin.sub_template,
         lifetime_used_traffic=None if reseted_usage is None else int(reseted_usage or 0) + used_traffic,
-        role=role,
+        role=restrict_subadmin_role(role) if role is not None and not role.is_owner else role,
         permission_overrides=RoleLimits.model_validate(db_admin.permission_overrides)
         if db_admin.permission_overrides
         else None,
@@ -158,7 +162,13 @@ async def get_admin(
     return admin
 
 
-async def create_admin(db: AsyncSession, admin: AdminCreate) -> Admin:
+async def create_admin(
+    db: AsyncSession,
+    admin: AdminCreate,
+    *,
+    parent_admin_id: int | None = None,
+    blocked_by_parent: bool = False,
+) -> Admin:
     """
     Creates a new admin in the database.
 
@@ -169,7 +179,12 @@ async def create_admin(db: AsyncSession, admin: AdminCreate) -> Admin:
     Returns:
         Admin: The created admin object.
     """
-    db_admin = Admin(**admin.model_dump(exclude={"password"}), hashed_password=await hash_password(admin.password))
+    db_admin = Admin(
+        **admin.model_dump(exclude={"password"}),
+        hashed_password=await hash_password(admin.password),
+        parent_admin_id=parent_admin_id,
+        blocked_by_parent=blocked_by_parent,
+    )
     db.add(db_admin)
     await db.commit()
     await db.refresh(db_admin)
@@ -316,6 +331,7 @@ async def get_admins(
     compact: bool = False,
     include_owner: bool = True,
     load_role: bool = True,
+    parent_admin_id: int | None = None,
 ) -> list[Admin] | tuple[list[Admin], int, int, int, int]:
     """
     Retrieves a list of admins with optional filters and pagination.
@@ -337,9 +353,15 @@ async def get_admins(
     if return_with_count:
         counts_stmt = select(
             func.count(Admin.id).label("total"),
-            func.sum(case((Admin.status == AdminStatus.active, 1), else_=0)).label("active"),
-            func.sum(case((Admin.status == AdminStatus.disabled, 1), else_=0)).label("disabled"),
-            func.sum(case((Admin.status == AdminStatus.limited, 1), else_=0)).label("limited"),
+            func.sum(
+                case((and_(Admin.status == AdminStatus.active, Admin.blocked_by_parent.is_(False)), 1), else_=0)
+            ).label("active"),
+            func.sum(
+                case((or_(Admin.status == AdminStatus.disabled, Admin.blocked_by_parent.is_(True)), 1), else_=0)
+            ).label("disabled"),
+            func.sum(
+                case((and_(Admin.status == AdminStatus.limited, Admin.blocked_by_parent.is_(False)), 1), else_=0)
+            ).label("limited"),
         )
         if params.ids:
             counts_stmt = counts_stmt.where(Admin.id.in_(params.ids))
@@ -347,6 +369,8 @@ async def get_admins(
             counts_stmt = counts_stmt.where(Admin.username.in_(params.usernames))
         if params.username:
             counts_stmt = counts_stmt.where(Admin.username.ilike(f"%{params.username}%"))
+        if parent_admin_id is not None:
+            counts_stmt = counts_stmt.where(Admin.parent_admin_id == parent_admin_id)
         if not include_owner:
             counts_stmt = counts_stmt.where(Admin.role.has(AdminRole.is_owner.is_(False)))
 
@@ -399,6 +423,8 @@ async def get_admins(
         stmt = stmt.where(Admin.username.in_(params.usernames))
     if params.username:
         stmt = stmt.where(Admin.username.ilike(f"%{params.username}%"))
+    if parent_admin_id is not None:
+        stmt = stmt.where(Admin.parent_admin_id == parent_admin_id)
     if not include_owner:
         stmt = stmt.where(Admin.role.has(AdminRole.is_owner.is_(False)))
 
@@ -430,6 +456,7 @@ async def get_admins_simple(
     db: AsyncSession,
     query: AdminSimpleListQuery,
     include_owner: bool = True,
+    parent_admin_id: int | None = None,
 ) -> tuple[list[tuple[int, str]], int]:
     """
     Retrieves lightweight admin data with only id and username.
@@ -449,6 +476,8 @@ async def get_admins_simple(
         stmt = stmt.where(Admin.username.in_(query.usernames))
     if query.search:
         stmt = stmt.where(Admin.username.ilike(f"%{query.search}%"))
+    if parent_admin_id is not None:
+        stmt = stmt.where(Admin.parent_admin_id == parent_admin_id)
     if not include_owner:
         stmt = stmt.where(Admin.role.has(AdminRole.is_owner.is_(False)))
 
@@ -641,8 +670,11 @@ async def get_limited_admin_ids_with_user_sync(db: AsyncSession) -> set[int]:
         select(Admin.id)
         .join(AdminRole, Admin.role_id == AdminRole.id)
         .where(
-            Admin.status == AdminStatus.limited,
-            AdminRole.disconnect_users_when_limited.is_(True),
+            Admin.blocked_by_parent.is_(True)
+            | (
+                (Admin.status == AdminStatus.limited)
+                & AdminRole.disconnect_users_when_limited.is_(True)
+            ),
         )
     )
     result = await db.execute(stmt)
@@ -742,7 +774,11 @@ async def get_admin_usages(
     ]
 
     if admin_id is not None:
-        conditions.append(User.admin_id == admin_id)
+        admin_ids = sorted(await get_admin_descendant_ids(db, admin_id))
+        admin_id_filters = (
+            User.admin_id.in_(admin_ids[offset : offset + 500]) for offset in range(0, len(admin_ids), 500)
+        )
+        conditions.append(or_(*admin_id_filters))
 
     if node_id is not None:
         conditions.append(NodeUserUsage.node_id == node_id)

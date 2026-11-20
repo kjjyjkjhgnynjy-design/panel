@@ -29,6 +29,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.sql.functions import coalesce
 
 from app.db.compiles_types import DateDiff, ElapsedSeconds
+from app.db.crud.admin_hierarchy import adjust_admin_traffic_counters
 from app.db.models import (
     Admin,
     AdminStatus,
@@ -395,12 +396,25 @@ def _user_hwid_count_subquery():
 
 async def get_admin_users_for_node_sync(
     db: AsyncSession,
-    admin_id: int,
+    admin_id: int | Sequence[int],
     *,
     statuses: Sequence[UserStatus] | None = None,
 ) -> list[User]:
     """Load an admin's users for node dispatch, without response-only fields or history."""
-    return await _get_users_for_node_sync(db, User.admin_id == admin_id, statuses=statuses)
+    if isinstance(admin_id, int):
+        return await _get_users_for_node_sync(db, User.admin_id == admin_id, statuses=statuses)
+
+    ids = list(admin_id)
+    users = []
+    for offset in range(0, len(ids), 500):
+        users.extend(
+            await _get_users_for_node_sync(
+                db,
+                User.admin_id.in_(ids[offset : offset + 500]),
+                statuses=statuses,
+            )
+        )
+    return users
 
 
 async def get_role_users_for_node_sync(
@@ -2235,8 +2249,10 @@ async def set_owner(db: AsyncSession, db_user: User, admin: Admin) -> User:
 
     # Update admin traffic counters
     if old_admin and old_admin.id != admin.id:
-        old_admin.used_traffic -= db_user.used_traffic
-        admin.used_traffic += db_user.used_traffic
+        await adjust_admin_traffic_counters(
+            db,
+            {old_admin.id: -int(db_user.used_traffic or 0), admin.id: int(db_user.used_traffic or 0)},
+        )
 
     await db.commit()
     await refresh_and_load_user(db, db_user)
@@ -2255,31 +2271,19 @@ async def bulk_set_owner(db: AsyncSession, users: list[User], admin: Admin) -> l
     Returns:
         list[User]: The refreshed users.
     """
-    # Group users by old admin to update traffic counters
-    admin_traffic_changes = {}
-    total_traffic_to_add = 0
+    # Apply each user's traffic change to the direct owner and all ancestors.
+    admin_traffic_changes: dict[int, int] = {}
 
     for user in users:
         old_admin = user.admin
         # Only traffic that moves from another admin counts, like set_owner.
         if old_admin and old_admin.id != admin.id:
-            if old_admin.id not in admin_traffic_changes:
-                admin_traffic_changes[old_admin.id] = 0
-            admin_traffic_changes[old_admin.id] -= user.used_traffic
-            total_traffic_to_add += user.used_traffic
+            traffic = int(user.used_traffic or 0)
+            admin_traffic_changes[old_admin.id] = admin_traffic_changes.get(old_admin.id, 0) - traffic
+            admin_traffic_changes[admin.id] = admin_traffic_changes.get(admin.id, 0) + traffic
         user.admin = admin
 
-    # Update old admins' traffic
-    for admin_id, traffic_change in admin_traffic_changes.items():
-        await db.execute(
-            update(Admin).where(Admin.id == admin_id).values(used_traffic=Admin.used_traffic + traffic_change)
-        )
-
-    # Update new admin's traffic
-    if total_traffic_to_add > 0:
-        await db.execute(
-            update(Admin).where(Admin.id == admin.id).values(used_traffic=Admin.used_traffic + total_traffic_to_add)
-        )
+    await adjust_admin_traffic_counters(db, admin_traffic_changes)
 
     await db.commit()
     for user in users:
