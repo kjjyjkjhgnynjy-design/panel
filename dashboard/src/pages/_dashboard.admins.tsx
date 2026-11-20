@@ -24,6 +24,7 @@ export default function AdminsPage() {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
   const { admin: currentAdmin } = useAdmin()
+  const isOwnerAdmin = Boolean(currentAdmin?.role?.is_owner)
   const canCreateAdmins = hasPermission(currentAdmin, 'admins', 'create')
   const canUpdateAdmins = hasPermission(currentAdmin, 'admins', 'update')
   const [editingAdmin, setEditingAdmin] = useState<Partial<AdminDetails> | null>(null)
@@ -36,7 +37,7 @@ export default function AdminsPage() {
 
   const removeAdminMutation = useRemoveAdminById()
   const modifyAdminMutation = useModifyAdminById()
-  const rolesQuery = useGetRolesSimple({ query: { enabled: canUpdateAdmins } })
+  const rolesQuery = useGetRolesSimple({ query: { enabled: isOwnerAdmin && canUpdateAdmins } })
   const resetUsageMutation = useResetAdminUsageById()
   const handleError = useDynamicErrorHandler()
 
@@ -223,10 +224,10 @@ export default function AdminsPage() {
     <div className="flex w-full flex-col items-start gap-2">
       <div className="w-full transform-gpu">
         <PageHeader
-          title="admins.title"
-          description="admins.description"
+          title={isOwnerAdmin ? 'admins.title' : 'admins.mySubadminsTitle'}
+          description={isOwnerAdmin ? 'admins.description' : 'admins.mySubadminsDescription'}
           buttonIcon={Plus}
-          buttonText={canCreateAdmins ? 'admins.createAdmin' : undefined}
+          buttonText={canCreateAdmins ? (isOwnerAdmin ? 'admins.createAdmin' : 'admins.createSubadmin') : undefined}
           onButtonClick={canCreateAdmins ? handleCreateAdmin : undefined}
         />
         <Separator />
