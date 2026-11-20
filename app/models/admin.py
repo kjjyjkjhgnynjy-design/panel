@@ -9,7 +9,7 @@ import bcrypt
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, computed_field, field_validator
 
 from app.db.models import AdminStatus
-from app.models.admin_role import RoleAccess, RoleFeatures, RoleHWIDSettings, RoleLimits, RolePermissions
+from app.models.admin_role import PermissionScope, RoleAccess, RoleFeatures, RoleHWIDSettings, RoleLimits, RolePermissions
 from app.models.settings import CustomVariable, validate_custom_variables
 from app.models.stats import Period
 from app.utils.helpers import has_markup_unsafe_chars
@@ -73,6 +73,56 @@ class AdminRoleData(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+def restrict_subadmin_role(role: AdminRoleData | None) -> AdminRoleData | None:
+    """Keep a subagent inside its parent's grants and limit user data to its own account."""
+    if role is None:
+        return None
+
+    scoped_actions = {
+        "users": {
+            "read", "read_simple", "update", "delete", "reset_usage", "revoke_sub", "activate_next_plan",
+        },
+    }
+    permission_ceiling = {
+        "users": {"read", "read_simple", "create", "update", "delete", "reset_usage", "revoke_sub", "activate_next_plan"},
+        "groups": {"read", "read_simple"},
+        "templates": {"read", "read_simple"},
+        "client_templates": {"read", "read_simple"},
+    }
+
+    permissions: dict[str, dict[str, object]] = {}
+    for resource, allowed_actions in permission_ceiling.items():
+        parent_actions = role.permissions.get(resource)
+        if parent_actions is None:
+            continue
+        grants: dict[str, object] = {}
+        for action in allowed_actions:
+            value = parent_actions.get(action)
+            if value is True or isinstance(value, dict) and value.get("scope") not in (None, PermissionScope.NONE, 0):
+                grants[action] = (
+                    {"scope": PermissionScope.OWN}
+                    if action in scoped_actions.get(resource, set())
+                    else True
+                )
+        if grants:
+            permissions[resource] = grants
+
+    # Admin targets are restricted to direct children in AdminOperation.
+    permissions["admins"] = {
+        "create": True,
+        "read": True,
+        "read_simple": True,
+        "update": True,
+        "delete": True,
+        "reset_usage": True,
+    }
+
+    # Accounting is a per-account ledger, so it is safe for every subagent to manage its own entries.
+    permissions["accounting"] = {"create": True, "read": True, "delete": True}
+    restricted_permissions = RolePermissions.model_validate(permissions)
+    return role.model_copy(update={"is_owner": False, "permissions": restricted_permissions})
+
+
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -127,6 +177,8 @@ class AdminDetails(AdminContactInfo):
     """Complete admin model with all fields for database representation and API responses."""
 
     total_users: int = 0
+    parent_admin_id: int | None = None
+    blocked_by_parent: bool = False
     used_traffic: int = 0
     data_limit: int | None = None
     status: AdminStatus = AdminStatus.active

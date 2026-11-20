@@ -75,6 +75,12 @@ class APIKeysPermissions(CRUDPermissions):
     create: bool | None = None
 
 
+class AccountingPermissions(_ResourcePermissions):
+    create: RoleActionValue | None = None
+    read: RoleActionValue | None = None
+    delete: RoleActionValue | None = None
+
+
 class HostsPermissions(_ResourcePermissions):
     create: RoleActionValue | None = None
     read: RoleActionValue | None = None
@@ -144,6 +150,7 @@ class RolePermissions(BaseModel):
     hwids: HwidsPermissions | None = None
     admin_roles: CRUDPermissions | None = None
     api_keys: APIKeysPermissions | None = None
+    accounting: AccountingPermissions | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
