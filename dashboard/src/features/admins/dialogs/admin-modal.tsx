@@ -95,9 +95,10 @@ export default function AdminModal({ isDialogOpen, onOpenChange, editingAdminId,
   const queryClient = useQueryClient()
   const { admin: currentAdmin } = useAdmin()
   const currentAdminDetails = currentAdmin as unknown as AdminDetails | null
+  const isOwnerAdmin = Boolean(currentAdminDetails?.role?.is_owner)
   const addAdminMutation = useCreateAdmin()
   const modifyAdminMutation = useModifyAdminById()
-  const rolesQuery = useGetRolesSimple()
+  const rolesQuery = useGetRolesSimple({ query: { enabled: isOwnerAdmin } })
   const selectedRoleId = form.watch('role_id')
   const isEditingCurrentAdmin = Boolean(editingAdmin && currentAdminDetails && ((currentAdminDetails.id != null && editingAdminId === currentAdminDetails.id) || form.getValues('username') === currentAdminDetails.username))
   const passkeyAdminId = editingAdminId ?? (isEditingCurrentAdmin ? currentAdminDetails?.id : null)
@@ -266,8 +267,12 @@ export default function AdminModal({ isDialogOpen, onOpenChange, editingAdminId,
         custom_variables: normalizeCustomVariablesForPayload(values.custom_variables),
         note: values.note,
         notification_enable: values.notification_enable || null,
-        role_id: values.role_id,
-        permission_overrides: normalizePermissionOverrides(values.permission_overrides),
+        ...(isOwnerAdmin
+          ? {
+              role_id: values.role_id,
+              permission_overrides: normalizePermissionOverrides(values.permission_overrides),
+            }
+          : {}),
       }
       if (editingAdmin && editingAdminId != null) {
         const updatedAdmin = await modifyAdminMutation.mutateAsync({
@@ -309,8 +314,8 @@ export default function AdminModal({ isDialogOpen, onOpenChange, editingAdminId,
           custom_variables: normalizeCustomVariablesForPayload(values.custom_variables),
           note: values.note,
           notification_enable: values.notification_enable || null,
-          role_id: values.role_id,
-          permission_overrides: normalizePermissionOverrides(values.permission_overrides),
+          role_id: currentAdminDetails?.role?.id ?? values.role_id,
+          ...(isOwnerAdmin ? { permission_overrides: normalizePermissionOverrides(values.permission_overrides) } : {}),
         }
         const createdAdmin = await addAdminMutation.mutateAsync({
           data: createData,
@@ -353,7 +358,13 @@ export default function AdminModal({ isDialogOpen, onOpenChange, editingAdminId,
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             {editingAdmin ? <Pencil className="h-5 w-5" /> : <UserCog className="h-5 w-5" />}
-            <span>{editingAdmin ? t('admins.editAdmin') : t('admins.createAdmin')}</span>
+            <span>
+              {editingAdmin
+                ? t('admins.editAdmin')
+                : t(isOwnerAdmin ? 'admins.createAdmin' : 'admins.createSubadmin', {
+                    defaultValue: isOwnerAdmin ? 'Create admin' : 'Create subadmin',
+                  })}
+            </span>
           </DialogTitle>
           <DialogDescription className="sr-only">{t('admins.description', { defaultValue: 'Configure admin account settings.' })}</DialogDescription>
         </DialogHeader>
@@ -378,53 +389,55 @@ export default function AdminModal({ isDialogOpen, onOpenChange, editingAdminId,
                     )
                   }}
                 />
-                <FormField
-                  control={form.control}
-                  name="role_id"
-                  render={({ field }) => {
-                    const isOwnerAdmin = editingAdmin && selectedRoleId === 1
-                    return (
-                      <FormItem>
-                        <FormLabel>{t('admins.role')}</FormLabel>
-                        <Select value={field.value?.toString() || '3'} onValueChange={value => field.onChange(Number(value))} disabled={isOwnerAdmin}>
-                          <FormControl>
-                            <SelectTrigger>
-                              <SelectValue placeholder={t('admins.role')} />
-                            </SelectTrigger>
-                          </FormControl>
-                          <SelectContent>
-                            {isOwnerAdmin && (
-                              <SelectItem value="1" disabled>
-                                {t('adminRoles.names.owner', { defaultValue: 'Owner' })}
-                              </SelectItem>
-                            )}
-                            {!selectedRoleExists && !isOwnerAdmin && selectedRoleId != null && (
-                              <SelectItem value={String(selectedRoleId)} disabled>
-                                {t('adminRoles.currentRoleUnavailable', { defaultValue: 'Current role unavailable' })}
-                              </SelectItem>
-                            )}
-                            {roleOptions.map(role => (
-                              <SelectItem key={role.id} value={role.id.toString()}>
-                                {t(`adminRoles.names.${role.name}`, { defaultValue: role.name })}
-                              </SelectItem>
-                            ))}
-                            {rolesQuery.isLoading && (
-                              <SelectItem value="loading" disabled>
-                                {t('loading', { defaultValue: 'Loading...' })}
-                              </SelectItem>
-                            )}
-                            {rolesQuery.isError && (
-                              <SelectItem value="roles-error" disabled>
-                                {t('adminRoles.loadFallback', { defaultValue: 'Using built-in roles' })}
-                              </SelectItem>
-                            )}
-                          </SelectContent>
-                        </Select>
-                        <FormMessage />
-                      </FormItem>
-                    )
-                  }}
-                />
+                {isOwnerAdmin && (
+                  <FormField
+                    control={form.control}
+                    name="role_id"
+                    render={({ field }) => {
+                      const isOwnerRole = editingAdmin && selectedRoleId === 1
+                      return (
+                        <FormItem>
+                          <FormLabel>{t('admins.role')}</FormLabel>
+                          <Select value={field.value?.toString() || '3'} onValueChange={value => field.onChange(Number(value))} disabled={isOwnerRole}>
+                            <FormControl>
+                              <SelectTrigger>
+                                <SelectValue placeholder={t('admins.role')} />
+                              </SelectTrigger>
+                            </FormControl>
+                            <SelectContent>
+                              {isOwnerRole && (
+                                <SelectItem value="1" disabled>
+                                  {t('adminRoles.names.owner', { defaultValue: 'Owner' })}
+                                </SelectItem>
+                              )}
+                              {!selectedRoleExists && !isOwnerRole && selectedRoleId != null && (
+                                <SelectItem value={String(selectedRoleId)} disabled>
+                                  {t('adminRoles.currentRoleUnavailable', { defaultValue: 'Current role unavailable' })}
+                                </SelectItem>
+                              )}
+                              {roleOptions.map(role => (
+                                <SelectItem key={role.id} value={role.id.toString()}>
+                                  {t(`adminRoles.names.${role.name}`, { defaultValue: role.name })}
+                                </SelectItem>
+                              ))}
+                              {rolesQuery.isLoading && (
+                                <SelectItem value="loading" disabled>
+                                  {t('loading', { defaultValue: 'Loading...' })}
+                                </SelectItem>
+                              )}
+                              {rolesQuery.isError && (
+                                <SelectItem value="roles-error" disabled>
+                                  {t('adminRoles.loadFallback', { defaultValue: 'Using built-in roles' })}
+                                </SelectItem>
+                              )}
+                            </SelectContent>
+                          </Select>
+                          <FormMessage />
+                        </FormItem>
+                      )
+                    }}
+                  />
+                )}
                 <FormField
                   control={form.control}
                   name="password"
@@ -478,7 +491,7 @@ export default function AdminModal({ isDialogOpen, onOpenChange, editingAdminId,
                     </FormItem>
                   )}
                 />
-                <AdminDataLimitField form={form} />
+                <AdminDataLimitField form={form} showQuotaHint={!isOwnerAdmin && !(editingAdmin && isEditingCurrentAdmin)} />
               </div>
 
               {/* Advanced settings: collapsed by default */}
@@ -873,21 +886,23 @@ export default function AdminModal({ isDialogOpen, onOpenChange, editingAdminId,
                   </AccordionContent>
                 </AccordionItem>
 
-                <AccordionItem className="rounded-md border px-4 [&_[data-state=closed]]:no-underline [&_[data-state=open]]:no-underline" value="overrides">
-                  <AccordionTrigger>
-                    <div className="flex items-center gap-2">
-                      <Sliders className="h-4 w-4" />
-                      <span>{t('admins.permissionOverrides', { defaultValue: 'Permission overrides' })}</span>
-                      <span className="text-muted-foreground text-xs">{permissionOverridesCount}/9</span>
-                    </div>
-                  </AccordionTrigger>
-                  <AccordionContent className="px-1 pt-1">
-                    <p className="text-muted-foreground mb-3 text-xs">
-                      {t('admins.permissionOverridesHint', { defaultValue: 'Leave empty to inherit limits from the selected role. Set to 0 to disable.' })}
-                    </p>
-                    <PermissionOverridesFields form={form} />
-                  </AccordionContent>
-                </AccordionItem>
+                {isOwnerAdmin && (
+                  <AccordionItem className="rounded-md border px-4 [&_[data-state=closed]]:no-underline [&_[data-state=open]]:no-underline" value="overrides">
+                    <AccordionTrigger>
+                      <div className="flex items-center gap-2">
+                        <Sliders className="h-4 w-4" />
+                        <span>{t('admins.permissionOverrides', { defaultValue: 'Permission overrides' })}</span>
+                        <span className="text-muted-foreground text-xs">{permissionOverridesCount}/9</span>
+                      </div>
+                    </AccordionTrigger>
+                    <AccordionContent className="px-1 pt-1">
+                      <p className="text-muted-foreground mb-3 text-xs">
+                        {t('admins.permissionOverridesHint', { defaultValue: 'Leave empty to inherit limits from the selected role. Set to 0 to disable.' })}
+                      </p>
+                      <PermissionOverridesFields form={form} />
+                    </AccordionContent>
+                  </AccordionItem>
+                )}
               </Accordion>
             </div>
             <div className="flex justify-end gap-2 pt-2">
@@ -955,7 +970,7 @@ function PermissionOverridesFields({ form }: { form: AdminForm }) {
   )
 }
 
-function AdminDataLimitField({ form }: { form: AdminForm }) {
+function AdminDataLimitField({ form, showQuotaHint = false }: { form: AdminForm; showQuotaHint?: boolean }) {
   const { t } = useTranslation()
 
   return (
@@ -985,6 +1000,13 @@ function AdminDataLimitField({ form }: { form: AdminForm }) {
                 <span className="text-muted-foreground pointer-events-none absolute top-1/2 right-3 -translate-y-1/2 text-xs font-medium">{t('userDialog.gb', { defaultValue: 'GB' })}</span>
               </div>
             </FormControl>
+            {showQuotaHint && (
+              <p className="text-muted-foreground mt-1 text-xs">
+                {t('admins.subadminQuotaHint', {
+                  defaultValue: 'At least 500 GB must remain in your quota and each parent quota.',
+                })}
+              </p>
+            )}
             {numericValue != null && numericValue > 0 && numericValue < ONE_GB_IN_BYTES && (
               <p dir="ltr" className="text-muted-foreground mt-1 w-full text-end text-[11px]">
                 {formatBytes(numericValue)}
