@@ -33,6 +33,20 @@ def make_sub_config_key(
     status = getattr(user, "status", None)
     status_key = status.value if hasattr(status, "value") else status
     inbounds = getattr(user, "inbounds", None) or ()
+    admin = getattr(user, "admin", None)
+    host_preferences = getattr(admin, "host_preferences", None) or {}
+    hosts = host_preferences.get("hosts", {})
+    host_preferences_key = tuple(
+        sorted(
+            (
+                str(host_id),
+                preference.get("remark"),
+                preference.get("priority"),
+                preference.get("enabled", True),
+            )
+            for host_id, preference in hosts.items()
+        )
+    )
     proxy_settings = getattr(user, "proxy_settings", None)
     # Every protocol builder reads per-user proxy settings. In particular, a
     # cached links subscription otherwise keeps old Shadowsocks credentials
@@ -52,6 +66,7 @@ def make_sub_config_key(
         getattr(user, "used_traffic", None) if config_format == "wireguard" else None,
         expire_key,
         tuple(inbounds),
+        host_preferences_key,
         proxy_key,
     )
 
